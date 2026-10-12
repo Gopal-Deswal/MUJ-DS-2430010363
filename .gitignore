@@ -1,0 +1,15 @@
+# Dataset (too large, link it in the README instead)
+*.csv.zip
+data/
+MachineLearningCVE/
+GeneratedLabelledFlows/
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+venv/
+.env
+# LaTeX build junk
+*.aux
+*.log
+*.out
+*.toc
