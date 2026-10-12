@@ -1,0 +1,755 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\title{\textbf{A Compact CNN-LSTM Network Intrusion Detection System \\
+with Leave-One-Attack-Out Generalization Analysis on CICIDS2017}}
+\author{Gopal Deswal \\ \small Under the guidance of: Sandeep Gupta}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Network Intrusion Detection Systems (NIDS) based on deep learning have reported near-ceiling
+accuracies on the CICIDS2017 benchmark, with published CNN-LSTM and hybrid architectures
+routinely exceeding 99\% under conventional random-split evaluation. We argue, and empirically
+demonstrate, that this evaluation protocol is a poor proxy for real-world robustness: a model can
+achieve arbitrarily high accuracy while having learned to recognize only the specific attack
+categories present at training time, with no guarantee of behavior on a category it has never
+encountered -- precisely the scenario a zero-day attack presents. In this work we first build a
+compact CNN-LSTM classifier (33{,}761 parameters, roughly an order of magnitude smaller than
+typical published architectures) that reaches 98.29\% test accuracy and 0.9989 ROC-AUC under
+standard evaluation, with a train-test accuracy gap of 0.0005 and a 5-fold cross-validation
+standard deviation of 1.39\%, indicating low bias and low variance under this protocol. We then
+subject the same model to a stricter Leave-One-Attack-Out (LOAO) evaluation, in which an entire
+attack category is withheld from training and treated as unseen at test time, across four
+categories (DoS Hulk, PortScan, DDoS, Bot). Accuracy falls to 63--80\% depending on category, with
+a complete recall failure (0.00\%) on Bot traffic -- a failure mode that, notably, exactly matches
+an independent finding by Xu and Liu (2025) on a different CNN architecture and category set,
+suggesting a structural rather than implementation-specific cause. We provide a distribution-shift
+argument, grounded in empirical risk minimization theory, for why this collapse is expected rather
+than anomalous. We then test whether two classifier-independent signals -- embedding-space distance
+to class centroids and benign-only autoencoder reconstruction error -- can recover any of this lost
+performance, via a formal four-condition ablation. We find negligible improvement (under 0.3
+percentage points in every configuration), a negative result we use to localize the true bottleneck
+to the learned representation itself rather than to the decision rule applied on top of it. On
+standard evaluation our model is competitive with, though does not exceed, the strongest published
+figures (99.49--99.97\%), while using substantially fewer parameters; under LOAO evaluation, to our
+knowledge no compared work reports this protocol at all, making direct superiority claims
+inapplicable rather than favorable or unfavorable. We conclude with a concrete, mathematically
+motivated direction for closing this gap: replacing centroid comparison with instance-level
+retrieval and training the embedding space itself under a metric-learning objective rather than
+plain cross-entropy classification.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+\subsection{Motivation}
+
+Network intrusion detection sits at the front line of modern cybersecurity infrastructure, tasked
+with distinguishing malicious traffic from the overwhelming volume of benign network activity in
+real time. The rise of deep learning has reshaped this field: hybrid architectures combining
+convolutional layers (for local statistical feature extraction across flow-level attributes) with
+recurrent layers such as LSTM (for compositional feature aggregation across a flow's temporal
+structure) have become a dominant paradigm for NIDS research on the CICIDS2017 benchmark, with
+published results frequently exceeding 99\% accuracy \cite{afraji2025,kumar2023}. On the surface,
+this suggests the problem of network intrusion detection is close to solved.
+
+We argue this conclusion is premature, and that the near-ceiling accuracy figures dominating the
+literature reflect a property of the evaluation protocol rather than of the underlying detection
+capability. Under a standard random train/test split, every attack category present in the test
+set was also present, in different specific instances, during training. A model achieving 99\%
+accuracy under this protocol has demonstrated that it can generalize \emph{within} the distribution
+of attack behaviors it was shown -- a meaningfully narrower claim than generalizing to \emph{novel}
+attack behavior, which is the actual threat model a deployed NIDS must contend with. A zero-day
+attack is, by definition, a category absent from any training corpus available at the time the
+model was built. No amount of accuracy on known categories logically implies anything about
+behavior on an unknown one; this is the central methodological gap this work is built to probe.
+
+\subsection{Problem Formalization}
+\label{sec:formalization}
+
+Let $f_\theta : \mathcal{X} \to [0,1]$ denote the trained classifier, parameterized by $\theta$,
+fit via empirical risk minimization over a training set $\{(x_i, y_i)\}_{i=1}^{n}$ drawn i.i.d.\
+from a joint distribution $P_{\text{train}}(x, y)$:
+
+\begin{equation}
+\theta^{*} = \arg\min_{\theta} \; \frac{1}{n} \sum_{i=1}^{n} \mathcal{L}\big(f_\theta(x_i), y_i\big)
+\;+\; \lambda_1 \lVert \theta \rVert_1 \;+\; \lambda_2 \lVert \theta \rVert_2^2
+\label{eq:erm}
+\end{equation}
+
+where $\mathcal{L}$ is binary cross-entropy and the $\ell_1/\ell_2$ penalty terms constrain the
+effective hypothesis space, directly trading a small increase in bias for a reduction in variance
+-- the mechanism underlying the low train--test gap reported in Section~\ref{sec:standard-results}.
+Standard generalization guarantees for this procedure (e.g., PAC-style bounds) hold under the
+assumption that test examples are drawn from the same distribution $P_{\text{train}}$ as the
+training data. Under conventional random-split evaluation, this assumption is satisfied by
+construction: every category contributing to the test distribution also contributed, independently,
+to the training distribution.
+
+The Leave-One-Attack-Out (LOAO) protocol we adopt deliberately violates this assumption. Let
+$\mathcal{C} = \{c_1, \ldots, c_k\}$ denote the set of attack categories, and let
+$P_{c_j}(x \mid y=1)$ denote the conditional distribution of flow features for category $c_j$.
+Under LOAO, the model is trained on $P_{\text{train}}(x, y \mid \text{category} \neq c_j)$ for some
+withheld $c_j$, and evaluated on test examples drawn from $P_{c_j}(x \mid y=1)$ -- a distribution
+whose support the model has never observed under the positive class during training. No portion of
+the standard ERM generalization argument applies to this regime; the model's behavior on
+$P_{c_j}$ is, formally, extrapolation outside its training support, with no theoretical guarantee
+of correctness. We treat the resulting accuracy collapse (Section~\ref{sec:loao-results}) not as an
+anomaly requiring explanation away, but as the \emph{expected} consequence of this distribution
+mismatch -- and we use this framing to motivate why our subsequent augmentation attempt
+(Section~\ref{sec:augmentation}) targets the representation itself, since distance-based or
+reconstruction-based scoring rules computed within an embedding space shaped entirely by
+$P_{\text{train}}$ inherit the same support limitation. An embedding function
+$g_\theta : \mathcal{X} \to \mathbb{R}^{d}$ (here, the model's penultimate 32-dimensional layer) is
+itself a learned function of $\theta^{*}$, and $\theta^{*}$ was optimized with no exposure to
+$P_{c_j}$; there is no reason, a priori, to expect distances computed in $g_\theta(\mathcal{X})$ to
+separate $P_{c_j}$ from $P_{\text{benign}}$ any more reliably than $f_\theta$ itself does.
+
+\subsection{Contributions}
+
+This work makes the following contributions:
+
+\begin{enumerate}
+\item A compact, parameter-efficient CNN-LSTM classifier (33{,}761 parameters) evaluated under the
+standard CICIDS2017 protocol, with full bias-variance diagnostics (5-fold cross-validation,
+train/validation/test gap analysis) and a comparison against published state-of-the-art results.
+\item A Leave-One-Attack-Out evaluation across four withheld categories, quantifying the
+generalization gap between standard and zero-day-style evaluation that is absent from the compared
+literature \cite{afraji2025,kumar2023}.
+\item A formal, component-wise ablation testing whether embedding-distance and reconstruction-error
+signals can recover LOAO performance, reported as a negative result with an explicit
+distribution-shift explanation for why this outcome is theoretically expected rather than a failure
+of implementation.
+\item A cross-study convergence check against an independently reported CNN zero-recall failure on
+Bot traffic \cite{xu2025}, strengthening the claim that this specific failure mode is structural to
+the dataset and supervised paradigm rather than an artifact of either individual implementation.
+\end{enumerate}
+
+\subsection{Summary of Findings Relative to Prior Work}
+
+To state plainly where this work stands relative to the literature it compares against: under
+standard evaluation, our model does not exceed the highest published accuracy (99.97\%,
+\cite{kumar2023}) or the strongest published F1 (0.9956, \cite{afraji2025}); it performs comparably,
+within the same 97--99.9\% tier reported across CICIDS2017 studies, while using roughly an order of
+magnitude fewer parameters than either compared architecture, neither of which reports its
+parameter count. Under LOAO evaluation, direct comparison is not possible in the strict sense, since
+neither \cite{afraji2025} nor \cite{kumar2023} report results under this protocol at all -- our
+contribution here is introducing this harder evaluation to a setting where it has not previously
+been applied, rather than outperforming a directly comparable number. Where a LOAO-style comparison
+\emph{is} available, against Xu and Liu's unknown-attack evaluation \cite{xu2025}, our aggregate
+LOAO accuracy (70.66\%) is broadly comparable in magnitude to their reported figure (58.82\%), and
+our independent replication of their exact 0.0000 Bot-recall failure is, we argue, a more valuable
+finding than a favorable accuracy comparison would be, since it is evidence of a shared, structural
+limitation rather than an implementation-specific weakness in either study. We emphasize that we do
+not claim to outperform any individually comparable published figure, category-for-category; where
+a direct category-level comparison exists (Section~\ref{sec:related}), our result is either behind
+it or matches a known failure mode. Our augmentation ablation, finally, is an explicit negative
+result: neither centroid-distance nor reconstruction-error signals improve on the raw classifier's
+baseline LOAO performance, which we argue is itself an informative finding about where the true
+bottleneck in zero-day NIDS generalization lies.
+
+\subsection{Paper Organization}
+
+Section~\ref{sec:related} reviews related work on CICIDS2017 classification and
+zero-day/unseen-attack detection. Section~\ref{sec:dataset} describes the dataset and preprocessing
+pipeline. Section~\ref{sec:architecture} details the proposed architecture. Section~\ref{sec:standard-results}
+reports standard-evaluation results and the comparative analysis against published state-of-the-art
+methods. Section~\ref{sec:loao} presents the core contribution of this work: the LOAO evaluation,
+the augmentation ablation, and a mathematically grounded discussion of the negative result.
+Section~\ref{sec:deployment} discusses deployment implications, and Section~\ref{sec:conclusion}
+concludes with limitations and concrete directions for future work.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Supervised CNN-LSTM Architectures on CICIDS2017}
+
+Several published CNN-LSTM and hybrid architectures report near-ceiling accuracy on CICIDS2017
+under standard evaluation. Afraji et al.\ \cite{afraji2025} propose a parallel-fusion architecture
+that extracts spatial features via CNN, short-term temporal features via GRU, and long-term
+temporal dependencies via LSTM in parallel branches before fusion, achieving 99.49\% accuracy,
+99.25\% precision, and 99.88\% recall on CICIDS2017 -- the strongest published F1-score
+(0.9956) among the works surveyed for this comparison. Kumar and Sharma \cite{kumar2023} instead
+emphasize feature engineering: an intelligent hybrid feature selection stage reduces the input
+space to 27 discriminative features before classification, reaching 99.967\% accuracy, the highest
+published figure surveyed here. Neither work reports performance under a held-out-category
+(zero-day) evaluation protocol; both are evaluated exclusively under random-split conditions where
+every attack category represented in the test set is also represented, by other instances, in the
+training set.
+
+\subsection{Autoencoder-Based and Unsupervised Zero-Day Detection}
+
+A separate line of work sidesteps the held-out-category problem by never training on attack labels
+at all. Hindy et al.\ \cite{hindy2020} train an autoencoder exclusively on benign traffic and use
+reconstruction error, thresholded at several operating points (0.05, 0.10, 0.15), as an anomaly
+signal to flag zero-day attacks. Their per-category detection accuracy on CICIDS2017 varies
+substantially by attack type: attacks with large statistical separation from benign traffic (e.g.,
+DoS Hulk, DDoS) are detected with 92--99\% accuracy even at conservative thresholds, whereas attacks
+with subtler, benign-mimicking behavior (e.g., Botnet, PortScan at strict thresholds) are detected
+far less reliably, in some configurations below 20\% before threshold relaxation. This
+category-dependent difficulty is a recurring theme that our own LOAO results reproduce
+independently under a supervised rather than unsupervised paradigm, suggesting the difficulty is a
+property of the attack categories themselves rather than of any single detection methodology.
+
+This general finding -- that anomaly-detection paradigms trained without attack labels can
+sometimes generalize better to unseen threats than purely supervised classifiers, at the cost of
+elevated false-alarm rates -- is consistent with the broader anomaly detection literature
+\cite{chandola2009}, and with evaluation methodologies developed for related network security
+benchmarks such as UNSW-NB15 \cite{moustafa2016}.
+
+\subsection{Controlled Known-vs-Unknown Attack Comparisons}
+
+Most directly relevant to the present work, Xu and Liu \cite{xu2025} conduct a controlled comparison
+of supervised (MLP, CNN) and unsupervised (OCSVM, LOF) models on CICIDS2017 under both a standard
+evaluation and an explicit unknown-attack test set (DoS slowloris, DoS Slowhttptest, and Bot
+withheld from training). Their supervised CNN model achieves 96.50\% accuracy on the standard test
+set but collapses to 58.82\% accuracy and 19.54\% recall on the unknown-attack set. Critically, their
+reported per-class accuracy for CNN on the withheld Bot category is exactly $0.0000$ -- an identical
+total failure mode to what we independently observe for Bot in our own LOAO evaluation
+(Section~\ref{sec:loao-results}). This convergent finding across two independent studies, on the
+same dataset, using different CNN architectures and different withheld category sets, is strong
+evidence that the Bot-detection failure is a structural property of the dataset and supervised
+learning paradigm, not an artifact of a single implementation. We discuss the theoretical basis for
+why such convergence is expected, rather than coincidental, in Section~\ref{sec:discussion}.
+
+\subsection{Positioning of This Work}
+
+The literature reviewed above splits into two largely non-overlapping camps: works that push
+standard-evaluation accuracy toward its ceiling without testing generalization to unseen categories
+\cite{afraji2025,kumar2023}, and works that study unseen-category generalization but do not combine
+it with a rigorous component-wise ablation of candidate remedies
+\cite{hindy2020,xu2025}. This work sits at the intersection: it builds a standard-evaluation-competitive
+classifier, subjects it to the harder protocol, and -- rather than stopping at reporting the
+collapse -- formally tests, with an isolated ablation rather than a single before/after number,
+whether two plausible remedies recover any of the lost performance.
+
+\section{Dataset and Preprocessing}
+\label{sec:dataset}
+
+We use the CICIDS2017 dataset, comprising 2{,}830{,}743 labeled network flow records across 15
+classes (1 benign, 14 attack sub-types), generated by the Canadian Institute for Cybersecurity to
+reflect realistic enterprise network traffic. The raw class distribution is severely imbalanced:
+Benign traffic accounts for 85.46\% of records (1{,}977{,}318 samples), while the rarest class,
+Heartbleed, contains only 11 samples -- an imbalance ratio of approximately 179{,}756:1. The full
+label distribution is summarized in Table~\ref{tab:classdist}.
+
+\begin{table}[h]
+\centering
+\caption{CICIDS2017 class distribution (top classes by frequency).}
+\label{tab:classdist}
+\begin{tabular}{lrr}
+\toprule
+Class & Count & \% of Total \\
+\midrule
+Benign & 1{,}977{,}318 & 85.457 \\
+DoS Hulk & 172{,}846 & 7.470 \\
+DDoS & 128{,}014 & 5.533 \\
+DoS GoldenEye & 10{,}286 & 0.445 \\
+FTP-Patator & 5{,}931 & 0.256 \\
+DoS slowloris & 5{,}385 & 0.233 \\
+DoS Slowhttptest & 5{,}228 & 0.226 \\
+SSH-Patator & 3{,}219 & 0.139 \\
+PortScan & 1{,}956 & 0.085 \\
+Bot & 1{,}437 & 0.062 \\
+Heartbleed & 11 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Preprocessing Pipeline}
+
+For standard classification, the 14 attack sub-types are collapsed to a single ``Attack'' label,
+yielding a binary Benign/Attack task, and the dataset is balanced-sampled for computational
+tractability. All flow-level features are standardized to zero mean and unit variance using
+\texttt{StandardScaler}, fit exclusively on the training partition to prevent information leakage
+from validation or test distributions into the scaling statistics:
+
+\begin{equation}
+\hat{x}_{i,k} = \frac{x_{i,k} - \mu_k^{\text{train}}}{\sigma_k^{\text{train}}}
+\end{equation}
+
+where $\mu_k^{\text{train}}$ and $\sigma_k^{\text{train}}$ are the mean and standard deviation of
+feature $k$ computed only over training samples. Standardized features are reshaped to a
+(features, 1) sequence format to serve as input to the Conv1D front end. A stratified 70/15/15
+train/validation/test split is used for the standard-evaluation experiments, and an independent
+5-fold stratified cross-validation is run separately for the bias-variance diagnostic reported in
+Section~\ref{sec:standard-results}.
+
+\subsection{LOAO-Specific Partitioning}
+
+For the Leave-One-Attack-Out experiments (Section~\ref{sec:loao}), a separate partitioning
+procedure is required. For a given withheld category $c_j$, all records labeled $c_j$ are removed
+from the training and validation pools entirely; the training set retains benign traffic and every
+\emph{other} attack category. The test set is constructed from held-out benign traffic plus every
+record of the withheld category $c_j$, so that the test distribution for the positive class is
+$P_{c_j}(x \mid y=1)$ exactly, with no leakage of $c_j$ instances into any portion of training. This
+partitioning is repeated independently for each of the four withheld categories evaluated in this
+work (DoS Hulk, PortScan, DDoS, Bot), with a fresh model trained from random initialization for each.
+
+\section{Proposed Architecture}
+\label{sec:architecture}
+
+The classifier is a compact hybrid CNN-LSTM with two convolutional blocks feeding a single LSTM
+layer, summarized in Table~\ref{tab:arch}.
+
+\begin{table}[h]
+\centering
+\caption{Proposed CNN-LSTM architecture.}
+\label{tab:arch}
+\begin{tabular}{l}
+\toprule
+\textbf{Layer} \\
+\midrule
+Conv1D(64 filters, kernel=3, ReLU, L1L2 regularized) \\
+BatchNormalization \\
+MaxPooling1D(pool=2) \\
+Conv1D(32 filters, kernel=3, ReLU, L1L2 regularized) \\
+BatchNormalization \\
+MaxPooling1D(pool=2) \\
+LSTM(64 units) \\
+Dropout(0.3) \\
+Dense(32, ReLU) \\
+Dropout(0.3) \\
+Dense(1, sigmoid) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Layer-Level Formulation}
+
+Each one-dimensional convolution computes, for input sequence $x$, kernel $w$ of size $K$, and bias
+$b$:
+
+\begin{equation}
+(x * w)[t] = \sum_{k=0}^{K-1} x[t+k]\, w[k] + b, \qquad \text{followed by } \text{ReLU}(z) = \max(0, z).
+\end{equation}
+
+Each max-pooling operation reduces resolution and introduces local translation invariance:
+
+\begin{equation}
+y[t] = \max_{0 \le k < P} z[t \cdot S + k],
+\end{equation}
+
+where $P$ is the pooling window and $S$ the stride. The LSTM layer updates a hidden state
+$h_t$ and cell state $c_t$ via the standard gated recurrence:
+
+\begin{align}
+f_t &= \sigma(W_f [h_{t-1}, x_t] + b_f) \\
+i_t &= \sigma(W_i [h_{t-1}, x_t] + b_i) \\
+\tilde{c}_t &= \tanh(W_c [h_{t-1}, x_t] + b_c) \\
+c_t &= f_t \odot c_{t-1} + i_t \odot \tilde{c}_t \\
+o_t &= \sigma(W_o [h_{t-1}, x_t] + b_o) \\
+h_t &= o_t \odot \tanh(c_t)
+\end{align}
+
+which gives the recurrent layer the capacity to aggregate information across the convolved feature
+sequence while selectively retaining or discarding state, a property the CNN front end alone lacks.
+The final hidden state is passed through Dropout, a Dense(32) bottleneck -- which also serves as the
+embedding used for the distance-based augmentation in Section~\ref{sec:augmentation} -- a second
+Dropout, and a final sigmoid unit for binary classification:
+
+\begin{equation}
+\hat{y} = \sigma\big(W_{\text{out}} \cdot \text{Dense}_{32}(h_T) + b_{\text{out}}\big) = \frac{1}{1 + e^{-z}}.
+\end{equation}
+
+\subsection{Regularization and Parameter Budget}
+
+L1/L2 regularization ($\lambda_1 = 10^{-5}$, $\lambda_2 = 10^{-4}$ in Equation~\ref{eq:erm}) is
+applied to convolutional kernels to control overfitting without materially constraining model
+capacity. The model totals \textbf{33{,}761 parameters} (33{,}569 trainable), an order of magnitude
+smaller than most published CICIDS2017 architectures, which typically do not report parameter
+counts at all -- a property we revisit in Section~\ref{sec:deployment} as a deployment advantage
+independent of raw accuracy.
+
+\subsection{Training Procedure}
+
+Training uses the Adam optimizer with \texttt{EarlyStopping} (patience 3, restoring best weights on
+validation loss) and \texttt{ReduceLROnPlateau} to anneal the learning rate on validation-loss
+plateaus. A custom callback tracks test-set loss at every epoch purely for diagnostic plotting;
+critically, this value never influences any training decision, which depends only on the validation
+split, preserving the integrity of the held-out test set as a measure of generalization rather than
+of implicit tuning.
+
+\section{Standard Classification Results}
+\label{sec:standard-results}
+
+Training converged in 19 epochs (batch size 512, 480{,}544 training samples). Table~\ref{tab:biasvar}
+summarizes the bias-variance diagnostic.
+
+\begin{table}[h]
+\centering
+\caption{Bias-variance diagnostic.}
+\label{tab:biasvar}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+5-fold CV validation accuracy & $0.9721 \pm 0.0139$ \\
+Train accuracy & 0.9834 \\
+Validation accuracy & 0.9827 \\
+Test accuracy & 0.9829 \\
+Train--test accuracy gap & 0.0005 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The negligible train--test gap (0.05 percentage points) combined with a low cross-validation
+standard deviation (1.39\%) indicates \textbf{low bias and low variance}: the model is neither
+underfitting nor overfitting under the standard evaluation protocol. This diagnostic matters
+specifically because it rules out a confound in the LOAO results that follow in
+Section~\ref{sec:loao}: the collapse reported there cannot be attributed to the base model being
+poorly fit in general, since under the distribution it was actually trained on, it is well-calibrated
+by every standard bias-variance measure.
+
+Final test-set performance is summarized in Table~\ref{tab:testresults}.
+
+\begin{table}[h]
+\centering
+\caption{Test set performance (binary classification, standard split).}
+\label{tab:testresults}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Accuracy & 0.9829 \\
+Precision (weighted) & 0.9829 \\
+Recall (weighted) & 0.9829 \\
+F1-score (weighted) & 0.9829 \\
+Specificity & 0.9782 \\
+ROC-AUC & 0.9989 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparative Analysis with State-of-the-Art}
+\label{sec:sota}
+
+Table~\ref{tab:sota} places our model against three published results on CICIDS2017.
+
+\begin{table}[h]
+\centering
+\caption{Comparison against published CICIDS2017 results (standard evaluation only).}
+\label{tab:sota}
+\small
+\begin{tabular}{lrrl}
+\toprule
+Model & Accuracy & F1 & Parameters \\
+\midrule
+CNN-LSTM-GRU, parallel fusion \cite{afraji2025} & 0.9949 & 0.9956 & Not reported \\
+Hybrid DL, 27 selected features \cite{kumar2023} & 0.9997 & -- & Not reported \\
+Benign-only Autoencoder \cite{hindy2020} & 0.75--0.99* & -- & Not reported \\
+\textbf{Proposed CNN-LSTM (this work)} & \textbf{0.9829} & \textbf{0.9829} & \textbf{33{,}761} \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+\footnotesize{*Autoencoder detection accuracy is category-dependent (75--99\% range across attack
+types and thresholds); not a single aggregate figure.}
+\end{table}
+
+On standard evaluation, our model does not exceed the highest published figure (99.97\%
+\cite{kumar2023}), which uses a curated 27-feature subset and a more elaborate hybrid pipeline. Our
+architecture instead prioritizes efficiency: it uses the full feature set with roughly an order of
+magnitude fewer parameters than typical published architectures while remaining within the same
+accuracy tier (97--99.9\%) reported across CICIDS2017 studies. We state this comparison without
+qualification: on this specific metric, under this specific protocol, this work does not claim or
+demonstrate superiority over \cite{afraji2025} or \cite{kumar2023}. The contribution of this work
+lies instead in Section~\ref{sec:loao}, where none of the compared architectures have published
+results at all.
+
+\section{Innovation: Leave-One-Attack-Out Evaluation with Centroid- and Reconstruction-Based Augmentation}
+\label{sec:loao}
+
+\subsection{Motivation}
+
+A classifier trained to recognize specific attack categories provides no theoretical guarantee that
+it will recognize a category it has never seen, as formalized in Section~\ref{sec:formalization}.
+To test this empirically, we implement a Leave-One-Attack-Out (LOAO) protocol: for each of four
+attack categories (DoS Hulk, PortScan, DDoS, Bot), we retrain the CNN-LSTM from scratch with that
+category entirely excluded from the training pool, then evaluate on a test set containing only the
+withheld category plus held-out benign traffic. This directly measures generalization to a
+genuinely unseen threat, rather than to a held-out split of an already-seen distribution.
+
+\subsection{Augmentation Method}
+\label{sec:augmentation}
+
+Rather than relying solely on the retrained classifier's decision boundary, we test whether two
+additional, classifier-independent signals can recover generalization performance.
+
+\paragraph{Centroid-distance features.} The 32-dimensional embedding $g_\theta(x) \in \mathbb{R}^{32}$
+from the model's penultimate Dense layer is extracted for every training sample. A benign centroid
+and one centroid per \emph{known} attack category (i.e., excluding the withheld one) are computed as
+class-wise embedding means:
+
+\begin{equation}
+\mu_{\text{benign}} = \frac{1}{|\mathcal{B}|} \sum_{x_i \in \mathcal{B}} g_\theta(x_i), \qquad
+\mu_{c} = \frac{1}{|\mathcal{A}_c|} \sum_{x_i \in \mathcal{A}_c} g_\theta(x_i) \;\; \forall c \in \mathcal{C} \setminus \{c_j\}
+\end{equation}
+
+where $\mathcal{B}$ is the benign training set and $\mathcal{A}_c$ is the training set for known
+attack category $c$. For each query sample, three features are derived: Euclidean distance to the
+benign centroid, Euclidean distance to the nearest known-attack centroid, and the signed gap between
+the two:
+
+\begin{equation}
+d_{\text{benign}}(x) = \lVert g_\theta(x) - \mu_{\text{benign}} \rVert_2, \qquad
+d_{\text{attack}}(x) = \min_{c \in \mathcal{C} \setminus \{c_j\}} \lVert g_\theta(x) - \mu_c \rVert_2
+\end{equation}
+
+\begin{equation}
+\Delta(x) = d_{\text{benign}}(x) - d_{\text{attack}}(x)
+\end{equation}
+
+The underlying hypothesis is that a genuinely novel attack should embed far from both known
+clusters, or at least measurably closer to the attack region than to benign.
+
+\paragraph{Benign-only autoencoder reconstruction error.} A small autoencoder
+(input$\to$32$\to$8$\to$32$\to$input, trained with Adam and mean-squared-error loss) is trained
+exclusively on benign traffic in the raw scaled feature space. For encoder $E$ and decoder $D$, the
+reconstruction error on a query sample is:
+
+\begin{equation}
+r(x) = \frac{1}{m} \sum_{k=1}^{m} \big(x_k - D(E(x))_k\big)^2
+\end{equation}
+
+where $m$ is the feature dimensionality. This signal is computed independently of the CNN-LSTM
+entirely and is intended as a category-agnostic ``does this resemble normal traffic'' score.
+
+\paragraph{Meta-classifier.} These signals are combined with the base classifier's output
+probability $p(x) = f_\theta(x)$ via a lightweight logistic regression meta-classifier, evaluated
+under a four-condition ablation so that each component's individual contribution can be isolated:
+
+\begin{align}
+\text{Baseline:} \quad & p(x) \ge 0.5 \\
+\text{Exp1 (A):} \quad & \sigma(w_0 \, p(x) + b) \\
+\text{Exp2 (A+B):} \quad & \sigma\big(w_0 \, p(x) + w_1 \, d_{\text{benign}}(x) + w_2 \, d_{\text{attack}}(x) + w_3 \, \Delta(x) + b\big) \\
+\text{Proposed (A+B+C):} \quad & \sigma\big(w_0 \, p(x) + w_1 \, d_{\text{benign}}(x) + w_2 \, d_{\text{attack}}(x) + w_3 \, \Delta(x) + w_4 \, r(x) + b\big)
+\end{align}
+
+This design isolates each component's contribution, rather than reporting a single before/after
+comparison that would conflate the two signals' individual effects.
+
+\subsection{A Note on Terminology}
+
+This design is inspired by the same intuition behind retrieval-augmented approaches -- using stored
+knowledge about known categories to inform a new decision -- but it is \textbf{not}
+Retrieval-Augmented Generation (RAG). No generative model is used, and there is no instance-level
+retrieval step: distances are computed against fixed, precomputed class centroids rather than
+against individually retrieved training examples. A more faithful adaptation of the retrieval
+paradigm to this classification setting would replace the centroid comparison with a
+$k$-nearest-neighbor search over stored training embeddings, using the label distribution of the
+retrieved neighbors as the augmenting signal. We identify this as a concrete direction for future
+work (Section~\ref{sec:limitations}) rather than claiming it as already implemented here.
+
+\subsection{Results}
+\label{sec:loao-results}
+
+Table~\ref{tab:loao} reports baseline (no augmentation) LOAO performance per withheld category, and
+Table~\ref{tab:ablation} reports the full ablation, averaged across all four categories.
+
+\begin{table}[h]
+\centering
+\caption{Baseline CNN-LSTM performance under LOAO evaluation (category fully withheld from training).}
+\label{tab:loao}
+\begin{tabular}{lrrr}
+\toprule
+Withheld Category & Accuracy & Recall & F1 \\
+\midrule
+DoS Hulk & 0.6319 & 0.6215 & 0.7665 \\
+PortScan & 0.7984 & 0.3712 & 0.5088 \\
+DDoS & 0.6443 & 0.6313 & 0.7736 \\
+Bot & 0.7519 & \textbf{0.0000} & \textbf{0.0000} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Ablation study, averaged across all four withheld categories. A = base classifier
+probability, B = centroid-distance features, C = autoencoder reconstruction error.}
+\label{tab:ablation}
+\begin{tabular}{lrrr}
+\toprule
+Condition & Accuracy & Recall & F1 \\
+\midrule
+Baseline (A only, direct) & 0.7066 & 0.4060 & 0.5122 \\
+Exp1: A (recalibrated) & 0.7063 & 0.4068 & 0.5124 \\
+Exp2: A+B & 0.7053 & 0.4063 & 0.5119 \\
+Proposed: A+B+C & 0.7053 & 0.4063 & 0.5119 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two findings stand out. First, accuracy collapses substantially relative to the 98.29\%
+standard-split result whenever an entire category is withheld, confirming empirically what
+Section~\ref{sec:formalization} predicts theoretically: the standard evaluation in
+Section~\ref{sec:sota} does not reflect zero-day robustness. Second, and central to the ablation's
+purpose, the added centroid-distance and autoencoder signals produce \textbf{negligible change}
+relative to the baseline classifier probability alone -- in most conditions the difference is within
+0.1--0.3 percentage points, and on Bot specifically, recall remains exactly 0\% across every
+configuration tested.
+
+\subsection{Discussion: Interpreting the Negative Result}
+\label{sec:discussion}
+
+We do not present the ablation result as an improvement, and we consider it important to state this
+plainly rather than overstate the outcome. The value of this experiment lies in what it rules out:
+the bottleneck limiting zero-day generalization in this setting is not the \emph{scoring rule}
+applied after classification, since neither embedding-distance nor reconstruction-error augmentation
+recovers meaningful performance. This points instead to the \emph{representation itself} -- as
+argued formally in Section~\ref{sec:formalization}, the 32-dimensional embedding space learned by
+the CNN-LSTM is shaped entirely by the attack categories present during training, via the same
+optimization (Equation~\ref{eq:erm}) that produces $\theta^{*}$. Distances measured within that
+space, even to a well-chosen set of centroids, do not carry reliable information about categories
+the space was never shaped to separate, because $g_\theta$ was never optimized with any objective
+that would encourage such separation for an unseen class. A reconstruction-error signal computed
+independently of the classifier fares no better here, though prior work shows autoencoder-based
+detection \emph{can} succeed when attacks are statistically well-separated from benign traffic
+\cite{hindy2020} -- our LOAO setting evidently does not provide that separation for the categories
+tested.
+
+The complete recall failure on Bot (0.00\% in every condition) is not, in isolation, evidence of a
+flaw specific to our implementation. Xu and Liu \cite{xu2025} independently report an identical
+0.0000 per-class accuracy for a CNN model on withheld Bot traffic in CICIDS2017, using a different
+architecture and a different held-out category set. The convergence of two independent studies on
+this exact failure mode is stronger evidence that Bot traffic is intrinsically difficult to
+generalize to under a supervised, fully-withheld evaluation than any single result could provide
+alone -- and is consistent with the distribution-support argument of Section~\ref{sec:formalization}:
+if Bot traffic occupies a region of feature space poorly separated from benign traffic even when
+\emph{included} in training (a property independent of which model is used), then no amount of
+representational capacity withheld-category retraining can be expected to fix, since the issue is
+not a withheld-category artifact but a property of the category's statistical signature relative to
+benign traffic. Averaged across all four withheld categories, our baseline LOAO accuracy (70.66\%)
+is broadly comparable in magnitude to the unknown-attack accuracy Xu and Liu report for their CNN
+model (58.82\%); we note this only as a coarse, order-of-magnitude comparison, since the two studies
+withhold different category sets and use different sampling and feature pipelines, not as a
+controlled head-to-head benchmark. We do not interpret this comparison as evidence of superiority in
+any individual category; where the two studies' withheld categories overlap (Bot), the result is a
+tie in total failure, not an advantage for either study.
+
+\section{Real-World Applications}
+\label{sec:deployment}
+
+The compact parameter count (33{,}761) makes this architecture a reasonable candidate for
+resource-constrained deployment contexts -- edge gateways, IoT hubs, or embedded network appliances
+-- where a full-scale ensemble or transformer-based IDS would be impractical. On the
+standard-evaluation task, the model is well-suited to complement a signature-based system as a
+lightweight secondary classifier for known attack families, operating at low latency with a small
+memory footprint.
+
+However, the LOAO results in Section~\ref{sec:loao-results} carry a direct and important deployment
+implication: this class of model, on its own, should not be relied upon as a primary defense against
+attack categories not represented in its training data. In an enterprise or cloud Security Operations
+Center (SOC) context, this motivates a layered deployment strategy -- using the CNN-LSTM classifier
+for known-attack triage (where it performs well, Section~\ref{sec:sota}) while retaining human
+analyst review or a complementary boundary-based method for traffic flagged as anomalous but not
+confidently classified, particularly for categories with a documented history of poor
+supervised-model generalization such as Bot and PortScan traffic. The theoretical framing of
+Section~\ref{sec:formalization} generalizes beyond this specific architecture: \emph{any} classifier
+trained purely by empirical risk minimization over a fixed category set inherits the same
+support-limitation argument, suggesting this layered-deployment recommendation applies to the wider
+class of supervised NIDS models, not solely to the architecture studied here.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Augmentation did not close the generalization gap.} The centroid-distance and
+autoencoder signals tested here provided no meaningful recovery of LOAO performance. A concrete
+next step, motivated directly by this negative result, is to replace centroid-based comparison with
+genuine instance-level $k$-nearest-neighbor retrieval over stored training embeddings, and
+separately, to incorporate a contrastive or metric-learning training objective -- for instance, a
+triplet or supervised contrastive loss added to Equation~\ref{eq:erm} -- so that the embedding space
+itself is shaped to separate ``normal vs.\ anomalous'' rather than ``benign vs.\ these specific known
+attacks.''
+\item \textbf{Cross-study comparisons are approximate.} The comparison to \cite{xu2025} in
+Section~\ref{sec:loao-results} uses a different held-out category set, sampling strategy, and
+feature pipeline than this work, and should be read as directional evidence of a shared phenomenon
+rather than a controlled benchmark. A fully controlled replication, using an identical withheld
+category set and preprocessing pipeline across both architectures, is left to future work.
+\item \textbf{Bot detection remains an open problem.} Given its low absolute sample count (1{,}437
+records) and the convergent zero-recall finding across two independent studies, few-shot calibration
+using a small number of labeled Bot examples -- rather than a fully zero-shot setting -- may be a
+more tractable path than further zero-shot augmentation.
+\item \textbf{Only four categories were evaluated under LOAO.} A full leave-one-out sweep across
+all 14 attack sub-types, while computationally expensive (requiring one full retraining per
+category), would give a more complete picture of which categories are and are not tractable under
+this protocol, and is a natural extension of this work.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This work builds a parameter-efficient CNN-LSTM intrusion detector that is competitive with
+published CICIDS2017 results under standard evaluation, and then subjects it to a stricter, less
+commonly reported Leave-One-Attack-Out evaluation that more accurately reflects zero-day deployment
+conditions. Consistent with independently published findings \cite{xu2025}, we observe a substantial
+and, for one category, total collapse in detection performance under this harder protocol. A
+rigorous ablation of two candidate augmentation signals shows neither meaningfully recovers this
+lost performance, a negative result that -- grounded in the distribution-shift argument of
+Section~\ref{sec:formalization} -- localizes the generalization bottleneck to the learned
+representation rather than the post-hoc scoring method, and motivates a specific, actionable
+direction -- metric-learning-based representation training and genuine instance-level retrieval --
+for future work. We make no claim of outperforming prior work on any individually comparable metric;
+the contribution of this work is methodological -- introducing a harder, theoretically motivated
+evaluation protocol to a setting where it is largely absent, and providing rigorous, honestly
+reported negative evidence about what does and does not help under that protocol.
+
+\begin{thebibliography}{9}
+
+\bibitem{hindy2020}
+H. Hindy, R. Atkinson, C. Tachtatzis, J.-N. Colin, E. Bayne, and X. Bellekens,
+``Utilising Deep Learning Techniques for Effective Zero-Day Attack Detection,''
+\textit{Electronics}, vol. 9, no. 10, p. 1684, 2020.
+\url{https://doi.org/10.3390/electronics9101684}
+
+\bibitem{afraji2025}
+D. M. A. A. Afraji, J. Lloret, and L. Pe\~nalver,
+``An Integrated Hybrid Deep Learning Framework for Intrusion Detection in IoT and IIoT Networks Using
+CNN-LSTM-GRU Architecture,''
+\textit{Computation}, vol. 13, no. 9, p. 222, 2025.
+\url{https://doi.org/10.3390/computation13090222}
+
+\bibitem{kumar2023}
+N. Kumar and S. Sharma,
+``A Hybrid Modified Deep Learning Architecture for Intrusion Detection System with Optimal Feature
+Selection,''
+\textit{Electronics}, vol. 12, no. 19, p. 4050, 2023.
+\url{https://doi.org/10.3390/electronics12194050}
+
+\bibitem{xu2025}
+Z. Xu and Y. Liu,
+``Robust Anomaly Detection in Network Traffic: Evaluating Machine Learning Models on CICIDS2017,''
+arXiv preprint arXiv:2506.19877, 2025.
+\url{https://arxiv.org/abs/2506.19877}
+
+\bibitem{chandola2009}
+V. Chandola, A. Banerjee, and V. Kumar,
+``Anomaly Detection: A Survey,''
+\textit{ACM Computing Surveys}, vol. 41, no. 3, Article 15, 2009.
+\url{https://doi.org/10.1145/1541880.1541882}
+
+\bibitem{moustafa2016}
+N. Moustafa and J. Slay,
+``The Evaluation of Network Anomaly Detection Systems: Statistical Analysis of the UNSW-NB15 Data
+Set and the Comparison with the KDD99 Data Set,''
+\textit{Information Security Journal: A Global Perspective}, vol. 25, no. 1--3, pp. 18--31, 2016.
+\url{https://doi.org/10.1080/19393555.2015.1125974}
+
+\end{thebibliography}
+
+\end{document}
